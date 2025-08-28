@@ -1,12 +1,12 @@
 import streamlit as st
-import requests, json, re
+import requests, json, re, feedparser
 from datetime import datetime, timedelta, timezone
 from dateutil import parser as dtparse
 
 # -----------------------------
 # App config
 # -----------------------------
-st.set_page_config(page_title="News Agent MVP", page_icon="📰", layout="wide")
+st.set_page_config(page_title="News Agent — Personalized & Actionable", page_icon="🗞️", layout="wide")
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # Secrets (Streamlit Cloud → App ▸ Settings ▸ Secrets)
@@ -14,7 +14,7 @@ NEWSAPI_KEY = st.secrets["NEWSAPI_KEY"]
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 
 # -----------------------------
-# Helpers (utilities)
+# Helpers (utilities & constants)
 # -----------------------------
 TABLOID = {
     "TMZ","Daily Mail","Page Six","The Sun","US Weekly","Radar Online","E! Online",
@@ -59,6 +59,27 @@ COUNTRY_KEYWORDS = {
     "ca": ["canada","ottawa","bank of canada","boc","loonie","toronto","vancouver","quebec"],
 }
 
+# Category → queries (for Everything API)
+CATEGORY_QUERIES = {
+    "tech": "technology OR AI OR software OR chips OR semiconductors OR startups OR cyber security OR apple OR google OR microsoft",
+    "finance": "markets OR stocks OR equities OR bonds OR banking OR fintech OR IPO OR RBI OR SEC OR SEBI OR interest rates",
+    "economy": "economy OR GDP OR inflation OR unemployment OR fiscal OR budget OR trade OR monetary policy OR central bank",
+    "health": "health OR healthcare OR wellness OR nutrition OR mental health OR covid OR vaccine OR WHO OR medical research",
+    "global": "world OR geopolitics OR ceasefire OR climate OR war OR summit OR sanctions OR trade deal"
+}
+
+# India RSS (augment National/local flavor)
+INDIA_RSS = [
+    "https://www.thehindu.com/feeder/default.rss",
+    "https://indianexpress.com/section/india/feed/",
+    "https://www.hindustantimes.com/feeds/rss/india-news/rssfeed.xml",
+    "https://www.livemint.com/rss/news",
+    "https://economictimes.indiatimes.com/rssfeedsdefault.cms",
+    "https://www.business-standard.com/rss/latest.rss",
+    "https://feeds.feedburner.com/ndtvnews-top-stories",
+    "https://timesofindia.indiatimes.com/rss.cms"
+]
+
 def as_ist(iso):
     try:
         return dtparse.parse(iso).astimezone(IST).strftime("%d %b, %H:%M IST")
@@ -66,15 +87,12 @@ def as_ist(iso):
         return ""
 
 def domain_of(url: str) -> str:
-    try:
-        return url.split("/")[2].replace("www.","")
-    except:
-        return ""
+    try: return url.split("/")[2].replace("www.","")
+    except: return ""
 
 def is_low_signal(a):
     src = (a.get("source") or {}).get("name") or ""
-    if src in TABLOID:
-        return True
+    if src in TABLOID: return True
     title = (a.get("title") or "").lower()
     return any(k in title for k in LOW_SIG)
 
@@ -84,19 +102,17 @@ def shape(arts):
         title = (a.get("title") or "").strip()
         url = a.get("url")
         src = (a.get("source") or {}).get("name") or "Source"
-        if not title or not url: 
-            continue
+        if not title or not url: continue
         k = title + url
-        if k in seen or is_low_signal(a):
-            continue
+        if k in seen or is_low_signal(a): continue
         seen.add(k)
         out.append({
             "title": title,
             "url": url,
             "source": src,
-            "published": a.get("publishedAt") or "",
+            "published": a.get("publishedAt") or a.get("pubDate") or "",
             "image": a.get("urlToImage"),
-            "desc": (a.get("description") or a.get("content") or "")[:900]
+            "desc": (a.get("description") or a.get("summary") or a.get("content") or "")[:1000]
         })
     # sort by outlet quality + recency
     now_utc = datetime.now(timezone.utc)
@@ -115,24 +131,77 @@ def shape(arts):
     return out
 
 def apply_exclusions(articles, exclude_kws):
-    if not exclude_kws:
-        return articles
+    if not exclude_kws: return articles
     out = []
     for a in articles:
         text = " ".join([a.get("title",""), a.get("desc",""), a.get("source","")]).lower()
-        if any(kw in text for kw in exclude_kws):
-            continue
+        if any(kw in text for kw in exclude_kws): continue
         out.append(a)
     return out
 
 def clear_expanded_summaries():
-    """Wipe cached expanded text so reading-level changes take effect."""
     for k in list(st.session_state.keys()):
-        if k.startswith("content_expand_"):
-            del st.session_state[k]
+        if k.startswith("content_expand_"): del st.session_state[k]
+
+def reorder_prioritize_local(items, country: str, n: int = 2):
+    """Move up to n local-domain items to the top while preserving order for the rest."""
+    locals_set = set(LOCAL_DOMAINS.get(country, []))
+    local, other = [], []
+    for it in items:
+        (local if domain_of(it["url"]) in locals_set else other).append(it)
+    head = local[:n]
+    tail = [x for x in items if x not in head]  # preserve original order beyond head picks
+    return head + tail
 
 # -----------------------------
-# NewsAPI calls (Top & Everything)
+# Lightweight "memory" (session only for MVP)
+# -----------------------------
+def init_memory():
+    st.session_state.setdefault("bookmarks", set())
+    st.session_state.setdefault("feedback", [])  # {url, title, label:+1/-1, ts}
+init_memory()
+
+def remember_feedback(url, title, label):
+    fb = st.session_state["feedback"]
+    fb.append({"url": url, "title": title, "label": label, "ts": datetime.now(timezone.utc).isoformat()})
+    st.session_state["feedback"] = fb
+
+def toggle_bookmark(url):
+    b = st.session_state["bookmarks"]
+    if url in b: b.remove(url)
+    else: b.add(url)
+    st.session_state["bookmarks"] = b
+
+# -----------------------------
+# Semantic embeddings (For You)
+# -----------------------------
+@st.cache_resource(show_spinner=False)
+def get_embedder():
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+def embed_texts(texts):
+    if not texts: return []
+    model = get_embedder()
+    return model.encode(texts, normalize_embeddings=True).tolist()
+
+def cosine_sim(a, b):
+    return sum(x*y for x,y in zip(a,b))
+
+def build_profile_vector(profile):
+    likes = [f["title"] for f in st.session_state.get("feedback", []) if f["label"] == +1][-5:]
+    parts = [
+        f"role: {profile.get('role','')}",
+        f"interests: {', '.join(profile.get('interests',[]))}",
+        f"country: {profile.get('country','')}",
+        f"liked: {', '.join(likes)}"
+    ]
+    text = " | ".join([p for p in parts if p.strip()])
+    vecs = embed_texts([text]) or [[0]*384]
+    return vecs[0]
+
+# -----------------------------
+# NewsAPI + RSS fetchers
 # -----------------------------
 @st.cache_data(ttl=180, show_spinner=False)
 def news_top(params: dict):
@@ -152,74 +221,127 @@ def news_everything(q: str, days: int = 2):
     r.raise_for_status()
     return r.json().get("articles", [])
 
-# -------- National (local but never empty): prefer local domains + geo-words, down-rank others
-@st.cache_data(ttl=180, show_spinner=False)
-def fetch_national(country: str):
-    pool = []
+def rss_pull(url, limit=25):
     try:
-        pool += news_top({"category":"general",    "country": country})
-        pool += news_top({"category":"business",   "country": country})
-        pool += news_top({"category":"technology", "country": country})
+        feed = feedparser.parse(url)
+        items = []
+        for e in feed.entries[:limit]:
+            title = e.get("title","").strip()
+            link  = e.get("link","")
+            desc  = (e.get("summary") or e.get("description") or "")[:1000]
+            pub   = e.get("published") or e.get("updated") or ""
+            items.append({
+                "title": title, "url": link, "source": domain_of(link) or "RSS",
+                "published": pub, "image": None, "desc": desc
+            })
+        return items
     except Exception:
-        pass
-    items = shape(pool) if pool else []
+        return []
 
-    if len(items) < 10:
-        backup = news_everything("economy OR policy OR parliament OR election OR business OR technology", days=2)
-        shaped = shape(backup)
-
-        local_domains = set(LOCAL_DOMAINS.get(country, []))
-        geo_words = set(COUNTRY_KEYWORDS.get(country, []))
-
-        def score_local(a):
-            s = 0
-            if domain_of(a["url"]) in local_domains: 
-                s += 3
-            text = (a["title"] + " " + (a.get("desc") or "")).lower()
-            if any(g in text for g in geo_words): 
-                s += 2
-            return s
-
-        shaped.sort(key=score_local, reverse=True)
-        items = (items + shaped)[:60] if items else shaped[:60]
-
-    return items[:60]
-
-# -------- Global
-@st.cache_data(ttl=180, show_spinner=False)
-def fetch_global():
-    pool = []
-    pool += news_everything("world OR economy OR inflation OR election OR ceasefire OR climate")
-    pool += news_everything("india OR europe OR china OR middle east OR us OR africa")
-    return shape(pool)[:60]
-
-# -------- For You (robust: interests → +geo → quality fallback)
-@st.cache_data(ttl=180, show_spinner=False)
-def fetch_for_you(interests: list[str], country: str | None = None):
+# -----------------------------
+# Category fetchers
+# -----------------------------
+@st.cache_data(ttl=240, show_spinner=False)
+def fetch_for_you(interests: list[str], country: str | None, profile_vec=None):
+    # Build robust pool
     terms = [t.strip() for t in (interests or []) if t.strip()]
     seen, cleaned = set(), []
     for t in terms:
         k = t.lower()
         if k not in seen:
             seen.add(k); cleaned.append(t)
-        if len(cleaned) >= 12:
-            break
+        if len(cleaned) >= 12: break
 
-    pool = []
+    pool_raw = []
     if cleaned:
-        q1 = " OR ".join(cleaned)
-        pool += news_everything(q1, days=2)
+        pool_raw += news_everything(" OR ".join(cleaned), days=2)
 
-    if len(pool) < 12 and country:
+    if len(pool_raw) < 12 and country:
         geo = COUNTRY_KEYWORDS.get(country, [])[:8]
         if geo:
-            q2 = " OR ".join((cleaned or []) + geo)
-            pool += news_everything(q2, days=3)
+            pool_raw += news_everything(" OR ".join((cleaned or []) + geo), days=3)
 
-    if len(pool) < 12:
-        pool += news_everything("technology OR business OR startups OR policy OR finance OR education", days=2)
+    if len(pool_raw) < 12:
+        pool_raw += news_everything("technology OR business OR startups OR policy OR finance OR education", days=2)
 
-    return shape(pool)[:60]
+    items = shape(pool_raw)
+    if not items: return []
+
+    # Semantic re-rank by profile vector
+    if profile_vec is None: 
+        items = reorder_prioritize_local(items, country or "in", n=2)
+        return items[:60]
+
+    corpus = [(a["title"] + " " + (a.get("desc") or "")) for a in items]
+    art_vecs = embed_texts(corpus)
+
+    scored = []
+    for a, v in zip(items, art_vecs):
+        try: s = cosine_sim(profile_vec, v)
+        except: s = 0.0
+        boost = 0.0
+        if a["source"] in MAJOR: boost += 0.05
+        try:
+            dt = dtparse.parse(a["published"])
+            hrs = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds()/3600
+            if hrs <= 24: boost += 0.08
+        except: pass
+        # preference memory
+        if any(f["url"] == a["url"] and f["label"] == +1 for f in st.session_state.get("feedback", [])):
+            boost += 0.1
+        scored.append((s+boost, a))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    ranked = [a for _,a in scored]
+    ranked = reorder_prioritize_local(ranked, country or "in", n=2)
+    return ranked[:60]
+
+@st.cache_data(ttl=240, show_spinner=False)
+def fetch_category(category: str, country: str):
+    pool = []
+    # Use Top-headlines when NewsAPI category exists
+    if category == "tech":
+        try: pool += news_top({"category":"technology", "country": country})
+        except: pass
+    if category == "health":
+        try: pool += news_top({"category":"health", "country": country})
+        except: pass
+    if category == "finance":
+        try: pool += news_top({"category":"business", "country": country})
+        except: pass
+    if category == "economy":
+        # business + general can carry macro
+        try:
+            pool += news_top({"category":"business", "country": country})
+            pool += news_top({"category":"general",  "country": country})
+        except: pass
+
+    # Everything API for richer pool
+    q = CATEGORY_QUERIES.get(category, "")
+    if q:
+        pool += news_everything(q, days=2)
+
+    items = shape(pool)
+    if country in ("in",) and len(items) < 25 and category in ("tech","finance","economy","health"):
+        # Blend some India RSS if needed
+        rss_items = []
+        for u in INDIA_RSS:
+            rss_items.extend(rss_pull(u, limit=15))
+        items = shape(items + rss_items)
+
+    # Prioritize local outlets for the first 1–2 slots
+    items = reorder_prioritize_local(items, country, n=2)
+    return items[:60]
+
+@st.cache_data(ttl=240, show_spinner=False)
+def fetch_global(country: str):
+    pool = []
+    pool += news_everything(CATEGORY_QUERIES["global"], days=2)
+    pool += news_everything("india OR europe OR china OR middle east OR us OR africa", days=2)
+    items = shape(pool)
+    # Still prioritize 1–2 local source items near the top for familiarity
+    items = reorder_prioritize_local(items, country, n=2)
+    return items[:60]
 
 # -----------------------------
 # Teaser (30–50 words) per reading level
@@ -230,7 +352,7 @@ def teaser_summary(title: str, snippet: str, source: str, level: str, time_str: 
         if level == "basic":
             style = "Use very simple words and short sentences. Define any jargon briefly. 30–50 words."
         elif level == "high":
-            style = "Be crisp and technical if needed; you can include a key term. 30–50 words."
+            style = "Be crisp and technical if needed; include one term if helpful. 30–50 words."
         else:
             style = "Be clear and neutral. 30–50 words."
 
@@ -262,58 +384,68 @@ def openai_chat(messages, temperature=0.25, model="gpt-4o-mini"):
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"].strip()
 
+def derive_persona(profile: dict) -> str:
+    role = (profile.get("role") or "").lower()
+    interests = ", ".join(profile.get("interests", []))
+    hints = []
+    if any(k in role for k in ["student","mba","law","bba","llb"]):
+        hints.append("wants case-study angles, regulation, compliance and career-relevant examples")
+    if any(k in role for k in ["product","analyst","manager","strategy"]):
+        hints.append("cares about user impact, unit economics, KPI movement, operational risk")
+    if any(k in role for k in ["marketing","social","brand"]):
+        hints.append("cares about brand-safety, platform policy, targeting constraints, creative angles")
+    if any(k in role for k in ["finance","invest","bank","fintech"]):
+        hints.append("cares about rates, liquidity, credit risk, regulatory changes")
+    if any(k in role for k in ["founder","startup"]):
+        hints.append("cares about GTM, TAM, regulatory barriers, hiring, runway")
+    if not hints: hints.append("prefers actionable, concrete insights")
+    return f"User role: {profile.get('role','')}. Interests: {interests}. This user {', and '.join(hints)}."
+
 def compute_context_hints(profile: dict, article: dict) -> list[str]:
     role = (profile.get("role") or "").lower()
     interests = [i.lower() for i in profile.get("interests", [])]
     text = " ".join([article.get("title",""), article.get("desc",""), article.get("source","")]).lower()
     hints = []
-
-    # Employment / macro
+    # Employment / macro → mobility, consumption
     if any(k in text for k in ["employment","jobs","hiring","unemployment","payroll","labour","labor"]):
         if any(k in role+str(interests) for k in ["mobility","road","safety","automotive","helmet","abs"]):
             hints += [
                 "Employment ↑ → daily commuting ↑ → two-wheeler & rideshare usage ↑ → road exposure ↑",
-                "Road exposure ↑ → accident frequency/severity ↑ → demand for helmets/ABS/road-safety gear ↑",
+                "Road exposure ↑ → accident frequency/severity ↑ → demand for helmets/ABS/safety gear ↑",
             ]
         hints += [
-            "Employment ↑ → disposable income ↑ → F&B / quick-commerce / leisure spend ↑",
-            "Employment ↑ → hiring pressure ↑ → wages ↑ → margin pressure unless prices/productivity adjust"
+            "Employment ↑ → disposable income ↑ → F&B / leisure / quick-commerce spend ↑",
+            "Employment ↑ → hiring pressure ↑ → wages ↑ → margin pressure unless pricing/productivity adjust"
         ]
-
     if any(k in text for k in ["inflation","cpi","wpi","prices","rbi","repo","rate hike","policy rate"]):
         hints += [
             "Rates ↑ → EMI ↑ → discretionary demand ↓; working capital cost ↑",
-            "Edible oil/sugar/grains prices ↑ → F&B margin squeeze unless pricing/pack-size changes"
+            "Edible oil/sugar/grains ↑ → F&B margin squeeze unless pricing/pack-size changes"
         ]
-
     if any(k in text for k in ["election","regulation","regulatory","bill","parliament","supreme court"]):
         hints += ["Policy uncertainty ↑ → ad-spend mix shifts; compliance updates; state-wise enforcement variance"]
-
     if any(k in text for k in ["instagram","meta","youtube","tiktok","ads policy","brand safety","content moderation"]):
         hints += ["Platform policy change → creative/targeting constraints → campaign refresh & brand-safety checks"]
-
     if any(k in text for k in ["heatwave","flood","monsoon","climate","rainfall","el niño","la niña"]):
-        hints += ["Weather anomaly → footfall/supply disruption risk; cold-chain/logistics stress; agri output variance"]
-
+        hints += ["Weather anomaly → footfall/logistics disruption; cold-chain stress; agri output variance"]
     if any(k in text for k in ["fssai","food safety","hygiene","contamination","recall"]):
-        hints += ["Tightening standards → SOP audit & staff training → vendor QA and labeling compliance"]
-
+        hints += ["Tighter standards → SOP audits & staff training → vendor QA and labeling compliance"]
     uniq = []
     for h in hints:
         if h not in uniq: uniq.append(h)
     return uniq[:6]
 
 def expand_summary(article, profile, level):
-    bounds = {"basic": (160,230), "normal": (150,210), "high": (220,320)}
-    lo, hi = bounds.get(level, (150,210))
+    bounds = {"basic": (170,240), "normal": (160,220), "high": (230,320)}
+    lo, hi = bounds.get(level, (160,220))
+    persona = derive_persona(profile)
     context_hints = compute_context_hints(profile, article)
 
-    if level == "basic":
-        style_line = "Use short sentences and simple words; define any jargon in parentheses."
-    elif level == "high":
-        style_line = "Be concise but analytical; use domain terms and simple micro-econ where relevant."
-    else:
-        style_line = "Be clear and concrete; avoid filler."
+    style_line = {
+        "basic": "Use short sentences and simple words; define any jargon in parentheses.",
+        "normal": "Be clear and concrete; avoid filler.",
+        "high": "Be concise but analytical; use domain terms and simple micro-econ where relevant."
+    }[level]
 
     system = (
         "You are an executive news analyst. Be specific and pragmatic.\n"
@@ -321,14 +453,14 @@ def expand_summary(article, profile, level):
         "• Use ONLY the provided title/description/source/time. No invented numbers or quotes.\n"
         "• Prefer concrete verbs; avoid vague hedging unless you add the mechanism.\n"
         "• Include at least one causal chain using A → B → C.\n"
-        "• Anchor analysis in the USER's role & interests. If the link is indirect, explain why it still matters.\n"
+        "• Anchor analysis in the USER's role & interests. If the link is indirect, explain why it still matters (lesson/case/analogy).\n"
         f"• Keep total length between {lo}–{hi} words.\n"
         "• If the article lacks detail, say 'Detail not in source:' once and keep analysis proportional.\n"
     )
 
     template = {
         "What happened": "Factual 1–2 lines based on title/description only.",
-        "Why it matters to YOU": "Advise the user. Include both Opportunity and Risk bullets.",
+        "Why it matters to YOU": "Advisory tone. Include both Opportunity and Risk bullets tied to persona.",
         "Mechanism chain": "At least one 2–3 step cause→effect chain touching the user's world.",
         "What to watch next": "3 concrete leading indicators (data, events, prices, platform changes).",
         "Decision checklist": "2–3 specific actions for the user's role (who/what/when).",
@@ -336,17 +468,23 @@ def expand_summary(article, profile, level):
         "Confidence": "High/Medium/Low + one-line reason."
     }
 
+    # lightweight preference hints
+    liked = [f["title"] for f in st.session_state.get("feedback", []) if f["label"] == +1][-5:]
+    disliked = [f["title"] for f in st.session_state.get("feedback", []) if f["label"] == -1][-5:]
+
     user = {
+        "PERSONA_BRIEF": persona,
         "USER": {"name": profile.get("name"), "role": profile.get("role"), "interests": profile.get("interests", [])},
         "ARTICLE": {
             "title": article.get("title"), "source": article.get("source"),
             "time": as_ist(article.get("published")), "snippet": article.get("desc"), "url": article.get("url")
         },
         "DERIVED_CONTEXT_HINTS": context_hints,
+        "PREFERENCES": {"recent_likes": liked, "recent_dislikes": disliked},
         "STYLE": style_line, "STRUCTURE": template
     }
     messages = [{"role":"system","content":system}, {"role":"user","content":json.dumps(user)}]
-    return openai_chat(messages, temperature=0.25, model="gpt-4o-mini")
+    return openai_chat(messages, temperature=0.23, model="gpt-4o-mini")
 
 def clarify(article, profile, level, question=None):
     q = question or "Explain step-by-step HOW and WHY this news could affect me over the next 6–12 months."
@@ -359,15 +497,30 @@ def clarify(article, profile, level, question=None):
     return openai_chat(msgs, temperature=0.3)
 
 # -----------------------------
-# Styles
+# Styles (UI refresh)
 # -----------------------------
 st.markdown("""
 <style>
+:root {
+  --card-bg: #ffffff;
+  --card-br: 12px;
+  --muted: #6b7280;
+  --accent: #2f6feb;
+}
 .block-container { padding-top: 1rem; }
-.card { border: 1px solid #eee; border-radius: 14px; padding: 12px 14px; margin-bottom: 10px; }
-.title { font-weight: 700; }
-.meta { color: #666; font-size: 0.9rem; }
-.teaser { color: #2b2b2b; margin: 6px 0 10px 0; line-height: 1.35; }
+.header-title { font-size: 1.6rem; font-weight: 800; margin-bottom: .2rem; }
+.header-sub { color: var(--muted); margin-bottom: 1.0rem; }
+.card { background: var(--card-bg); border: 1px solid #eee; border-radius: var(--card-br); 
+        padding: 14px 16px; margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.03); }
+.title { font-weight: 700; font-size: 1.05rem; }
+.meta { color: #666; font-size: 0.9rem; margin-top: 2px; }
+.chips { margin-top: 6px; }
+.chip { display: inline-block; padding: 2px 8px; border: 1px solid #e5e7eb; border-radius: 999px; font-size: 0.75rem; color: #374151; margin-right: 6px; }
+.teaser { color: #222; margin: 8px 0 10px 0; line-height: 1.5; }
+.btnrow { margin-top: 6px; }
+a.btnlink { text-decoration: none; border: 1px solid #e5e7eb; padding: 6px 10px; border-radius: 8px; font-size: 0.85rem; }
+a.btnlink:hover { border-color: var(--accent); color: var(--accent); }
+hr.sep { border: none; border-top: 1px dashed #eee; margin: 10px 0; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -382,36 +535,33 @@ def init_state():
     st.session_state.setdefault("exclude_str", "celebrity,gossip,TMZ")
 init_state()
 
-# -----------------------------
 # Reading level previews
-# -----------------------------
 def reading_preview(level: str):
     if level == "basic":
         return ("**Basic** — short sentences, everyday words.\n"
-                "Example: *Prices went up slowly last month. This can change what people buy and what companies charge.*")
+                "Example: *Prices went up slowly. This can change what people buy and what companies charge.*")
     if level == "high":
         return ("**High** — denser detail and terms.\n"
-                "Example: *Core inflation plateaued, implying policy rates may stay restrictive; watch pass-through into FMCG input costs.*")
+                "Example: *Core inflation plateaued; policy may stay restrictive; watch FMCG input pass-through.*")
     return ("**Normal** — balanced tone.\n"
-            "Example: *Inflation held steady, which can influence interest rates and household spending in the near term.*")
+            "Example: *Inflation held steady, which can influence interest rates and household spending.*")
 
-# -----------------------------
 # Onboarding
-# -----------------------------
 def show_onboarding():
-    st.header("Tell us about you")
+    st.markdown('<div class="header-title">Tell us about you</div>', unsafe_allow_html=True)
+    st.markdown('<div class="header-sub">We personalize headlines, tone and actions to your world.</div>', unsafe_allow_html=True)
     col1, col2 = st.columns(2)
     with col1:
         name = st.text_input("Your name", placeholder="e.g., Ananya")
-        role = st.text_input("Work/Study", placeholder="e.g., MBA student (business & law)")
-        country = st.selectbox("Country for National news", ["in","us","gb","sg","au","ca"], index=0)
+        role = st.text_input("Work/Study", placeholder="e.g., Social media manager in F&B; MBA student (business & law)")
+        country = st.selectbox("Country for local prioritization", ["in","us","gb","sg","au","ca"], index=0)
     with col2:
         interests_str = st.text_area("Interests (comma separated)",
                                      placeholder="e.g., RBI policy, startups, food safety, climate, football")
         st.write("**Choose your reading level** (see previews):")
         lvl = st.radio("Reading level", ["basic","normal","high"], horizontal=True, label_visibility="collapsed")
         st.info(reading_preview(lvl))
-    if st.button("Get my personalized news ➜", type="primary"):
+    if st.button("Personalize my news →", type="primary"):
         st.session_state.profile.update({
             "name": (name or "").strip() or "Reader",
             "role": (role or "").strip() or "Professional/Student",
@@ -422,14 +572,11 @@ def show_onboarding():
         st.session_state.onboarded = True
         st.rerun()
 
-# -----------------------------
-# Renderer (teaser + Expand + Clarify) — safe keys
-# -----------------------------
+# Renderer (teaser + Expand + Clarify + Memory) — safe keys
 def render_list(articles, profile, tab_name: str):
     if not articles:
-        st.info("No articles available right now. Try switching tabs or refreshing in a minute (free NewsAPI tier can rate-limit).")
+        st.info("No articles available right now. Try refreshing in a minute (the free NewsAPI tier can rate-limit).")
         return
-
     for idx, a in enumerate(articles):
         base = f"{tab_name}_{idx}_{abs(hash(a['url']))}"
         btn_key      = f"btn_expand_{base}"
@@ -437,33 +584,50 @@ def render_list(articles, profile, tab_name: str):
         clarify_qkey = f"clar_q_{base}"
         clarify_btn  = f"clar_btn_{base}"
 
-        if content_key not in st.session_state:
-            st.session_state[content_key] = None
+        if content_key not in st.session_state: st.session_state[content_key] = None
 
         with st.container():
             st.markdown('<div class="card">', unsafe_allow_html=True)
             st.markdown(f'<div class="title">{a["title"]}</div>', unsafe_allow_html=True)
             st.markdown(f'<div class="meta">{a["source"]} • {as_ist(a["published"])}</div>', unsafe_allow_html=True)
 
+            # chips
+            st.markdown('<div class="chips"><span class="chip">Readable</span><span class="chip">Actionable</span></div>', unsafe_allow_html=True)
+
             teaser = teaser_summary(a["title"], a.get("desc") or "", a["source"], profile["reading_level"], as_ist(a["published"]))
             st.markdown(f'<div class="teaser">{teaser}</div>', unsafe_allow_html=True)
 
-            c1, c2 = st.columns([1,3])
+            c1, c2, c3 = st.columns([1.2,1.2,2])
             with c1:
-                if st.button("Expand", key=btn_key):
+                if st.button("🔍 Expand analysis", key=btn_key):
                     with st.spinner("Personalizing…"):
                         st.session_state[content_key] = expand_summary(a, profile, profile["reading_level"])
             with c2:
-                st.markdown(f"[Read original]({a['url']})")
+                st.markdown(f'<a class="btnlink" href="{a["url"]}" target="_blank">↗ Read original</a>', unsafe_allow_html=True)
+            with c3:
+                pass
 
             if st.session_state[content_key]:
+                st.markdown("<hr class='sep'/>", unsafe_allow_html=True)
                 st.markdown(st.session_state[content_key])
-                with st.expander("How? Why? (ask for causal explanation)", expanded=False):
+                with st.expander("How? Why? Ask for a causal explanation", expanded=False):
                     q = st.text_input("Ask a question (optional):", key=clarify_qkey, value="")
-                    if st.button("Clarify", key=clarify_btn):
+                    if st.button("Answer", key=clarify_btn):
                         with st.spinner("Thinking…"):
                             ans = clarify(a, profile, profile["reading_level"], question=q or None)
                             st.write(ans)
+
+                # memory buttons
+                c_like, c_dislike, c_save = st.columns([1,1,1])
+                with c_like:
+                    if st.button("👍 Useful", key=f"like_{base}"):
+                        remember_feedback(a["url"], a["title"], +1); st.success("Noted")
+                with c_dislike:
+                    if st.button("👎 Not for me", key=f"dislike_{base}"):
+                        remember_feedback(a["url"], a["title"], -1); st.info("We’ll show fewer like this")
+                with c_save:
+                    if st.button(("🔖 Saved" if a["url"] in st.session_state["bookmarks"] else "🔖 Save"), key=f"save_{base}"):
+                        toggle_bookmark(a["url"])
 
             st.markdown("</div>", unsafe_allow_html=True)
 
@@ -479,7 +643,7 @@ with st.sidebar:
     p = st.session_state.profile
     p["name"] = st.text_input("Name", value=p["name"])
     p["role"] = st.text_input("Work/Study", value=p["role"])
-    p["country"] = st.selectbox("Country (National tab)", ["in","us","gb","sg","au","ca"],
+    p["country"] = st.selectbox("Local preference (country)", ["in","us","gb","sg","au","ca"],
                                 index=["in","us","gb","sg","au","ca"].index(p["country"]))
     interests_str = st.text_area("Interests (comma separated)", value=", ".join(p["interests"]), height=90)
     p["interests"] = [i.strip() for i in interests_str.split(",") if i.strip()]
@@ -487,8 +651,7 @@ with st.sidebar:
     old_level = p["reading_level"]
     p["reading_level"] = st.radio("Reading level", ["basic","normal","high"],
                                   index=["basic","normal","high"].index(p["reading_level"]), horizontal=True)
-    if p["reading_level"] != old_level:
-        clear_expanded_summaries()
+    if p["reading_level"] != old_level: clear_expanded_summaries()
     st.caption("Change level → teasers + expansions adapt to the new level.")
 
     exclude_str = st.text_input("Exclude topics (comma separated)",
@@ -498,32 +661,59 @@ with st.sidebar:
 
     st.session_state.profile = p
 
-st.title("📰 News Agent — personalized & depth-on-demand")
+st.markdown('<div class="header-title">🗞️ Your personalized briefing</div>', unsafe_allow_html=True)
+st.markdown('<div class="header-sub">Depth on demand • Local-first • Actionable next steps</div>', unsafe_allow_html=True)
 
-tabs = st.tabs(["🇮🇳 National", "🌍 Global", "✨ For You"])
+# Tabs: For You, Tech, Finance, Economy, Health & Wellness, Global
+tabs = st.tabs(["✨ For You", "💻 Tech", "💸 Finance", "📈 Economy", "🩺 Health & Wellness", "🌍 Global"])
 
 with tabs[0]:
     try:
-        data = fetch_national(st.session_state.profile["country"])
-        data = apply_exclusions(data, EXCLUDE_KWS)
-        render_list(data, st.session_state.profile, tab_name="national")
-    except Exception as e:
-        st.error(f"Failed to load National feed: {e}")
-
-with tabs[1]:
-    try:
-        data = fetch_global()
-        data = apply_exclusions(data, EXCLUDE_KWS)
-        render_list(data, st.session_state.profile, tab_name="global")
-    except Exception as e:
-        st.error(f"Failed to load Global feed: {e}")
-
-with tabs[2]:
-    try:
-        data = fetch_for_you(st.session_state.profile["interests"], st.session_state.profile["country"])
+        prof_vec = build_profile_vector(st.session_state.profile)
+        data = fetch_for_you(st.session_state.profile["interests"], st.session_state.profile["country"], profile_vec=prof_vec)
         data = apply_exclusions(data, EXCLUDE_KWS)
         render_list(data, st.session_state.profile, tab_name="foryou")
     except Exception as e:
-        st.error(f"Failed to load For You feed: {e}")
+        st.error(f"Failed to load For You: {e}")
+
+with tabs[1]:
+    try:
+        data = fetch_category("tech", st.session_state.profile["country"])
+        data = apply_exclusions(data, EXCLUDE_KWS)
+        render_list(data, st.session_state.profile, tab_name="tech")
+    except Exception as e:
+        st.error(f"Failed to load Tech: {e}")
+
+with tabs[2]:
+    try:
+        data = fetch_category("finance", st.session_state.profile["country"])
+        data = apply_exclusions(data, EXCLUDE_KWS)
+        render_list(data, st.session_state.profile, tab_name="finance")
+    except Exception as e:
+        st.error(f"Failed to load Finance: {e}")
+
+with tabs[3]:
+    try:
+        data = fetch_category("economy", st.session_state.profile["country"])
+        data = apply_exclusions(data, EXCLUDE_KWS)
+        render_list(data, st.session_state.profile, tab_name="economy")
+    except Exception as e:
+        st.error(f"Failed to load Economy: {e}")
+
+with tabs[4]:
+    try:
+        data = fetch_category("health", st.session_state.profile["country"])
+        data = apply_exclusions(data, EXCLUDE_KWS)
+        render_list(data, st.session_state.profile, tab_name="health")
+    except Exception as e:
+        st.error(f"Failed to load Health & Wellness: {e}")
+
+with tabs[5]:
+    try:
+        data = fetch_global(st.session_state.profile["country"])
+        data = apply_exclusions(data, EXCLUDE_KWS)
+        render_list(data, st.session_state.profile, tab_name="global")
+    except Exception as e:
+        st.error(f"Failed to load Global: {e}")
 
 st.caption(f"Generated at {datetime.now(IST).strftime('%d %b %Y, %H:%M IST')} • MVP demo")
