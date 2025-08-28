@@ -195,17 +195,43 @@ def toggle_bookmark(url):
     st.session_state["bookmarks"] = b
 
 # =========================
-# Embeddings (semantic For You)
+# Embeddings (semantic For You) — SBERT if available, else OpenAI
 # =========================
+import os
+
+try:
+    from sentence_transformers import SentenceTransformer
+    HAS_SBERT = True
+except Exception:
+    HAS_SBERT = False
+
 @st.cache_resource(show_spinner=False)
 def get_embedder():
-    from sentence_transformers import SentenceTransformer
-    return SentenceTransformer("all-MiniLM-L6-v2")
+    if HAS_SBERT:
+        return SentenceTransformer("all-MiniLM-L6-v2")
+    return None  # OpenAI path
+
+def _oai_embed(batch_texts):
+    """OpenAI embeddings fallback (text-embedding-3-small)."""
+    if not batch_texts:
+        return []
+    url = "https://api.openai.com/v1/embeddings"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": "text-embedding-3-small", "input": batch_texts}
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    r.raise_for_status()
+    data = r.json()["data"]
+    return [item["embedding"] for item in data]
 
 def embed_texts(texts):
-    if not texts: return []
+    if not texts:
+        return []
     model = get_embedder()
-    return model.encode(texts, normalize_embeddings=True).tolist()
+    if model is not None:
+        # SBERT path
+        return model.encode(texts, normalize_embeddings=True).tolist()
+    # OpenAI fallback
+    return _oai_embed(texts)
 
 def cosine_sim(a, b):
     return sum(x*y for x,y in zip(a,b))
@@ -219,7 +245,7 @@ def build_profile_vector(profile):
         f"liked: {', '.join(likes)}"
     ]
     text = " | ".join([p for p in parts if p.strip()])
-    vecs = embed_texts([text]) or [[0]*384]
+    vecs = embed_texts([text]) or [[0.0]*1536]  # OpenAI vector size
     return vecs[0]
 
 # =========================
