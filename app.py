@@ -104,11 +104,26 @@ def news_everything(q: str, days: int = 2):
 
 @st.cache_data(ttl=180, show_spinner=False)
 def fetch_national(country: str):
+    # Primary: country top-headlines
     pool = []
-    pool += news_top({"category":"general", "country": country})
-    pool += news_top({"category":"business","country": country})
-    pool += news_top({"category":"technology","country": country})
-    return shape(pool)[:60]
+    try:
+        pool += news_top({"category":"general", "country": country})
+        pool += news_top({"category":"business","country": country})
+        pool += news_top({"category":"technology","country": country})
+    except Exception:
+        pass
+
+    items = shape(pool) if pool else []
+
+    # Fallback if the country feed is empty or too small (rate-limit/sparse)
+    if len(items) < 5:
+        try:
+            backup = news_everything("India OR New Delhi OR RBI OR Parliament OR Supreme Court", days=2)
+            items = shape(backup)
+        except Exception:
+            pass
+
+    return items[:60]
 
 @st.cache_data(ttl=180, show_spinner=False)
 def fetch_global():
@@ -243,31 +258,56 @@ def show_onboarding():
 # -----------------------------
 # Article list renderer (1-line + Expand + Clarify)
 # -----------------------------
-def render_list(articles, profile):
-    for a in articles:
+def render_list(articles, profile, tab_name: str):
+    """
+    Renders a list of articles with: 1-line snippet, Expand (profile summary), Clarify.
+    Keys are made unique per TAB + INDEX + URL + reading level.
+    We also keep widget keys and stored-content keys different to avoid collisions.
+    """
+    if not articles:
+        st.info("No articles available right now. Try switching tabs or refreshing in a minute (NewsAPI can rate-limit free keys).")
+        return
+
+    for idx, a in enumerate(articles):
         one = (a["desc"] or a["title"]).split(".")[0]
+
+        # Unique keys per row & level
+        base = f"{tab_name}_{idx}_{abs(hash(a['url']))}"
+        btn_key      = f"btn_expand_{base}"                           # button widget key
+        content_key  = f"content_expand_{base}_{profile['reading_level']}"  # where we store expanded text
+        clarify_exp  = f"exp_clar_{base}"
+        clarify_qkey = f"clar_q_{base}"
+        clarify_btn  = f"clar_btn_{base}"
+
+        # init content slot if needed
+        if content_key not in st.session_state:
+            st.session_state[content_key] = None
+
         with st.container():
             st.markdown('<div class="card">', unsafe_allow_html=True)
             st.markdown(f'<div class="title">{a["title"]}</div>', unsafe_allow_html=True)
             st.markdown(f'<div class="meta">{a["source"]} • {as_ist(a["published"])}</div>', unsafe_allow_html=True)
-            st.markdown(f'<div class="one-liner">{one[:160]}{"…" if len(one)>160 else ""}</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="one-liner">{one[:160]}{"…" if len(one)>160 else ""}</div>',
+                unsafe_allow_html=True
+            )
 
-            colA, colB = st.columns([1,3])
-            with colA:
-                key = f"exp_{hash(a['url'])}_{profile['reading_level']}"
-                if st.button("Expand", key=key):
+            c1, c2 = st.columns([1,3])
+            with c1:
+                if st.button("Expand", key=btn_key):
                     with st.spinner("Personalizing…"):
-                        st.session_state[key] = expand_summary(a, profile, profile["reading_level"])
-            with colB:
+                        st.session_state[content_key] = expand_summary(a, profile, profile["reading_level"])
+            with c2:
                 st.markdown(f"[Read original]({a['url']})")
 
-            # Show expansion + optional Clarify
-            key = f"exp_{hash(a['url'])}_{profile['reading_level']}"
-            if key in st.session_state:
-                st.markdown(st.session_state[key])
-                with st.expander("How? Why? (ask for causal explanation)"):
-                    q = st.text_input("Ask a question (optional):", key=f"q_{hash(a['url'])}")
-                    if st.button("Clarify", key=f"clar_{hash(a['url'])}"):
+            # Show expanded content
+            if st.session_state[content_key]:
+                st.markdown(st.session_state[content_key])
+
+                # Clarify block (unique keys)
+                with st.expander("How? Why? (ask for causal explanation)", expanded=False):
+                    q = st.text_input("Ask a question (optional):", key=clarify_qkey, value="")
+                    if st.button("Clarify", key=clarify_btn):
                         with st.spinner("Thinking…"):
                             ans = clarify(a, profile, profile["reading_level"], question=q or None)
                             st.write(ans)
@@ -302,21 +342,21 @@ tabs = st.tabs(["🇮🇳 National", "🌍 Global", "✨ For You"])
 with tabs[0]:
     try:
         data = fetch_national(st.session_state.profile["country"])
-        render_list(data, st.session_state.profile)
+        render_list(data, st.session_state.profile, tab_name="national")
     except Exception as e:
         st.error(f"Failed to load National feed: {e}")
 
 with tabs[1]:
     try:
         data = fetch_global()
-        render_list(data, st.session_state.profile)
+        render_list(data, st.session_state.profile, tab_name="global")
     except Exception as e:
         st.error(f"Failed to load Global feed: {e}")
 
 with tabs[2]:
     try:
         data = fetch_for_you(st.session_state.profile["interests"])
-        render_list(data, st.session_state.profile)
+        render_list(data, st.session_state.profile, tab_name="foryou")
     except Exception as e:
         st.error(f"Failed to load For You feed: {e}")
 
