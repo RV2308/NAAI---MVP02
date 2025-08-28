@@ -1,11 +1,11 @@
 import streamlit as st
-import requests, json, re, feedparser
+import requests, json, re
 from datetime import datetime, timedelta, timezone
 from dateutil import parser as dtparse
 
-# -----------------------------
+# =========================
 # App config
-# -----------------------------
+# =========================
 st.set_page_config(page_title="News Agent — Personalized & Actionable", page_icon="🗞️", layout="wide")
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -13,9 +13,9 @@ IST = timezone(timedelta(hours=5, minutes=30))
 NEWSAPI_KEY = st.secrets["NEWSAPI_KEY"]
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 
-# -----------------------------
-# Helpers (utilities & constants)
-# -----------------------------
+# =========================
+# Utilities & constants
+# =========================
 TABLOID = {
     "TMZ","Daily Mail","Page Six","The Sun","US Weekly","Radar Online","E! Online",
     "Perez Hilton","Hollywood Life","The Mirror","OK! Magazine"
@@ -30,7 +30,6 @@ MAJOR = {
     "The Hindu","The Economic Times","Mint","Indian Express","Business Standard","NDTV"
 }
 
-# Country → domains we treat as local
 LOCAL_DOMAINS = {
     "in": [
         "thehindu.com","indianexpress.com","hindustantimes.com","livemint.com",
@@ -45,7 +44,6 @@ LOCAL_DOMAINS = {
     "ca": ["cbc.ca","ctvnews.ca","theglobeandmail.com","nationalpost.com","financialpost.com"],
 }
 
-# Country → geo-keywords that imply local relevance
 COUNTRY_KEYWORDS = {
     "in": [
         "india","indian","delhi","mumbai","bengaluru","bangalore","chennai","kolkata","hyderabad",
@@ -59,7 +57,6 @@ COUNTRY_KEYWORDS = {
     "ca": ["canada","ottawa","bank of canada","boc","loonie","toronto","vancouver","quebec"],
 }
 
-# Category → queries (for Everything API)
 CATEGORY_QUERIES = {
     "tech": "technology OR AI OR software OR chips OR semiconductors OR startups OR cyber security OR apple OR google OR microsoft",
     "finance": "markets OR stocks OR equities OR bonds OR banking OR fintech OR IPO OR RBI OR SEC OR SEBI OR interest rates",
@@ -68,7 +65,6 @@ CATEGORY_QUERIES = {
     "global": "world OR geopolitics OR ceasefire OR climate OR war OR summit OR sanctions OR trade deal"
 }
 
-# India RSS (augment National/local flavor)
 INDIA_RSS = [
     "https://www.thehindu.com/feeder/default.rss",
     "https://indianexpress.com/section/india/feed/",
@@ -101,7 +97,7 @@ def shape(arts):
     for a in arts:
         title = (a.get("title") or "").strip()
         url = a.get("url")
-        src = (a.get("source") or {}).get("name") or "Source"
+        src = (a.get("source") or {}).get("name") or a.get("source") or "Source"
         if not title or not url: continue
         k = title + url
         if k in seen or is_low_signal(a): continue
@@ -110,11 +106,10 @@ def shape(arts):
             "title": title,
             "url": url,
             "source": src,
-            "published": a.get("publishedAt") or a.get("pubDate") or "",
+            "published": a.get("publishedAt") or a.get("pubDate") or a.get("published") or "",
             "image": a.get("urlToImage"),
             "desc": (a.get("description") or a.get("summary") or a.get("content") or "")[:1000]
         })
-    # sort by outlet quality + recency
     now_utc = datetime.now(timezone.utc)
     def score(item):
         s = 0
@@ -139,23 +134,50 @@ def apply_exclusions(articles, exclude_kws):
         out.append(a)
     return out
 
-def clear_expanded_summaries():
-    for k in list(st.session_state.keys()):
-        if k.startswith("content_expand_"): del st.session_state[k]
-
 def reorder_prioritize_local(items, country: str, n: int = 2):
-    """Move up to n local-domain items to the top while preserving order for the rest."""
     locals_set = set(LOCAL_DOMAINS.get(country, []))
     local, other = [], []
     for it in items:
         (local if domain_of(it["url"]) in locals_set else other).append(it)
     head = local[:n]
-    tail = [x for x in items if x not in head]  # preserve original order beyond head picks
+    tail = [x for x in items if x not in head]
     return head + tail
 
-# -----------------------------
-# Lightweight "memory" (session only for MVP)
-# -----------------------------
+def clear_expanded_summaries():
+    for k in list(st.session_state.keys()):
+        if k.startswith("content_expand_"): del st.session_state[k]
+
+# =========================
+# Optional RSS import (fail-safe)
+# =========================
+try:
+    import feedparser
+    HAS_FEEDPARSER = True
+except Exception:
+    HAS_FEEDPARSER = False
+
+def rss_pull(url, limit=25):
+    if not HAS_FEEDPARSER:
+        return []  # silently skip if not installed
+    try:
+        feed = feedparser.parse(url)
+        items = []
+        for e in feed.entries[:limit]:
+            title = e.get("title","").strip()
+            link  = e.get("link","")
+            desc  = (e.get("summary") or e.get("description") or "")[:1000]
+            pub   = e.get("published") or e.get("updated") or ""
+            items.append({
+                "title": title, "url": link, "source": (feed.feed.get("title") or "RSS"),
+                "published": pub, "image": None, "desc": desc
+            })
+        return items
+    except Exception:
+        return []
+
+# =========================
+# Lightweight memory (session)
+# =========================
 def init_memory():
     st.session_state.setdefault("bookmarks", set())
     st.session_state.setdefault("feedback", [])  # {url, title, label:+1/-1, ts}
@@ -172,9 +194,9 @@ def toggle_bookmark(url):
     else: b.add(url)
     st.session_state["bookmarks"] = b
 
-# -----------------------------
-# Semantic embeddings (For You)
-# -----------------------------
+# =========================
+# Embeddings (semantic For You)
+# =========================
 @st.cache_resource(show_spinner=False)
 def get_embedder():
     from sentence_transformers import SentenceTransformer
@@ -200,9 +222,9 @@ def build_profile_vector(profile):
     vecs = embed_texts([text]) or [[0]*384]
     return vecs[0]
 
-# -----------------------------
-# NewsAPI + RSS fetchers
-# -----------------------------
+# =========================
+# NewsAPI calls
+# =========================
 @st.cache_data(ttl=180, show_spinner=False)
 def news_top(params: dict):
     url = "https://newsapi.org/v2/top-headlines"
@@ -221,29 +243,11 @@ def news_everything(q: str, days: int = 2):
     r.raise_for_status()
     return r.json().get("articles", [])
 
-def rss_pull(url, limit=25):
-    try:
-        feed = feedparser.parse(url)
-        items = []
-        for e in feed.entries[:limit]:
-            title = e.get("title","").strip()
-            link  = e.get("link","")
-            desc  = (e.get("summary") or e.get("description") or "")[:1000]
-            pub   = e.get("published") or e.get("updated") or ""
-            items.append({
-                "title": title, "url": link, "source": domain_of(link) or "RSS",
-                "published": pub, "image": None, "desc": desc
-            })
-        return items
-    except Exception:
-        return []
-
-# -----------------------------
-# Category fetchers
-# -----------------------------
+# =========================
+# Fetchers (For You / Categories / Global / National via RSS blend)
+# =========================
 @st.cache_data(ttl=240, show_spinner=False)
 def fetch_for_you(interests: list[str], country: str | None, profile_vec=None):
-    # Build robust pool
     terms = [t.strip() for t in (interests or []) if t.strip()]
     seen, cleaned = set(), []
     for t in terms:
@@ -267,8 +271,7 @@ def fetch_for_you(interests: list[str], country: str | None, profile_vec=None):
     items = shape(pool_raw)
     if not items: return []
 
-    # Semantic re-rank by profile vector
-    if profile_vec is None: 
+    if profile_vec is None:
         items = reorder_prioritize_local(items, country or "in", n=2)
         return items[:60]
 
@@ -286,7 +289,6 @@ def fetch_for_you(interests: list[str], country: str | None, profile_vec=None):
             hrs = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds()/3600
             if hrs <= 24: boost += 0.08
         except: pass
-        # preference memory
         if any(f["url"] == a["url"] and f["label"] == +1 for f in st.session_state.get("feedback", [])):
             boost += 0.1
         scored.append((s+boost, a))
@@ -299,7 +301,6 @@ def fetch_for_you(interests: list[str], country: str | None, profile_vec=None):
 @st.cache_data(ttl=240, show_spinner=False)
 def fetch_category(category: str, country: str):
     pool = []
-    # Use Top-headlines when NewsAPI category exists
     if category == "tech":
         try: pool += news_top({"category":"technology", "country": country})
         except: pass
@@ -310,26 +311,24 @@ def fetch_category(category: str, country: str):
         try: pool += news_top({"category":"business", "country": country})
         except: pass
     if category == "economy":
-        # business + general can carry macro
         try:
             pool += news_top({"category":"business", "country": country})
             pool += news_top({"category":"general",  "country": country})
         except: pass
 
-    # Everything API for richer pool
     q = CATEGORY_QUERIES.get(category, "")
     if q:
         pool += news_everything(q, days=2)
 
     items = shape(pool)
-    if country in ("in",) and len(items) < 25 and category in ("tech","finance","economy","health"):
-        # Blend some India RSS if needed
+
+    # Blend India RSS if needed
+    if country == "in" and len(items) < 25 and category in ("tech","finance","economy","health"):
         rss_items = []
         for u in INDIA_RSS:
             rss_items.extend(rss_pull(u, limit=15))
         items = shape(items + rss_items)
 
-    # Prioritize local outlets for the first 1–2 slots
     items = reorder_prioritize_local(items, country, n=2)
     return items[:60]
 
@@ -339,20 +338,27 @@ def fetch_global(country: str):
     pool += news_everything(CATEGORY_QUERIES["global"], days=2)
     pool += news_everything("india OR europe OR china OR middle east OR us OR africa", days=2)
     items = shape(pool)
-    # Still prioritize 1–2 local source items near the top for familiarity
     items = reorder_prioritize_local(items, country, n=2)
     return items[:60]
 
-# -----------------------------
-# Teaser (30–50 words) per reading level
-# -----------------------------
+# =========================
+# OpenAI (teaser / expand / clarify)
+# =========================
+def openai_chat(messages, temperature=0.25, model="gpt-4o-mini"):
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    payload = {"model": model, "messages": messages, "temperature": temperature}
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"].strip()
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def teaser_summary(title: str, snippet: str, source: str, level: str, time_str: str) -> str:
     try:
         if level == "basic":
             style = "Use very simple words and short sentences. Define any jargon briefly. 30–50 words."
         elif level == "high":
-            style = "Be crisp and technical if needed; include one term if helpful. 30–50 words."
+            style = "Be crisp and technical if needed; include one precise term. 30–50 words."
         else:
             style = "Be clear and neutral. 30–50 words."
 
@@ -372,17 +378,6 @@ def teaser_summary(title: str, snippet: str, source: str, level: str, time_str: 
         base = snippet or title
         words = base.split()
         return " ".join(words[:45]) + ("…" if len(words) > 45 else "")
-
-# -----------------------------
-# LLM (OpenAI) for expansion / clarify
-# -----------------------------
-def openai_chat(messages, temperature=0.25, model="gpt-4o-mini"):
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    payload = {"model": model, "messages": messages, "temperature": temperature}
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"].strip()
 
 def derive_persona(profile: dict) -> str:
     role = (profile.get("role") or "").lower()
@@ -406,7 +401,6 @@ def compute_context_hints(profile: dict, article: dict) -> list[str]:
     interests = [i.lower() for i in profile.get("interests", [])]
     text = " ".join([article.get("title",""), article.get("desc",""), article.get("source","")]).lower()
     hints = []
-    # Employment / macro → mobility, consumption
     if any(k in text for k in ["employment","jobs","hiring","unemployment","payroll","labour","labor"]):
         if any(k in role+str(interests) for k in ["mobility","road","safety","automotive","helmet","abs"]):
             hints += [
@@ -458,6 +452,9 @@ def expand_summary(article, profile, level):
         "• If the article lacks detail, say 'Detail not in source:' once and keep analysis proportional.\n"
     )
 
+    liked = [f["title"] for f in st.session_state.get("feedback", []) if f["label"] == +1][-5:]
+    disliked = [f["title"] for f in st.session_state.get("feedback", []) if f["label"] == -1][-5:]
+
     template = {
         "What happened": "Factual 1–2 lines based on title/description only.",
         "Why it matters to YOU": "Advisory tone. Include both Opportunity and Risk bullets tied to persona.",
@@ -467,10 +464,6 @@ def expand_summary(article, profile, level):
         "Assumptions & unknowns": "1–2 assumptions; 1 unknown to verify.",
         "Confidence": "High/Medium/Low + one-line reason."
     }
-
-    # lightweight preference hints
-    liked = [f["title"] for f in st.session_state.get("feedback", []) if f["label"] == +1][-5:]
-    disliked = [f["title"] for f in st.session_state.get("feedback", []) if f["label"] == -1][-5:]
 
     user = {
         "PERSONA_BRIEF": persona,
@@ -496,9 +489,9 @@ def clarify(article, profile, level, question=None):
     msgs = [{"role":"system","content":system},{"role":"user","content":json.dumps(user)}]
     return openai_chat(msgs, temperature=0.3)
 
-# -----------------------------
-# Styles (UI refresh)
-# -----------------------------
+# =========================
+# Styles (UI polish)
+# =========================
 st.markdown("""
 <style>
 :root {
@@ -524,9 +517,9 @@ hr.sep { border: none; border-top: 1px dashed #eee; margin: 10px 0; }
 </style>
 """, unsafe_allow_html=True)
 
-# -----------------------------
-# Session state
-# -----------------------------
+# =========================
+# Session state & onboarding
+# =========================
 def init_state():
     st.session_state.setdefault("profile", {
         "name": "", "role": "", "interests": [], "reading_level": "normal", "country": "in",
@@ -535,7 +528,6 @@ def init_state():
     st.session_state.setdefault("exclude_str", "celebrity,gossip,TMZ")
 init_state()
 
-# Reading level previews
 def reading_preview(level: str):
     if level == "basic":
         return ("**Basic** — short sentences, everyday words.\n"
@@ -546,7 +538,6 @@ def reading_preview(level: str):
     return ("**Normal** — balanced tone.\n"
             "Example: *Inflation held steady, which can influence interest rates and household spending.*")
 
-# Onboarding
 def show_onboarding():
     st.markdown('<div class="header-title">Tell us about you</div>', unsafe_allow_html=True)
     st.markdown('<div class="header-sub">We personalize headlines, tone and actions to your world.</div>', unsafe_allow_html=True)
@@ -572,7 +563,6 @@ def show_onboarding():
         st.session_state.onboarded = True
         st.rerun()
 
-# Renderer (teaser + Expand + Clarify + Memory) — safe keys
 def render_list(articles, profile, tab_name: str):
     if not articles:
         st.info("No articles available right now. Try refreshing in a minute (the free NewsAPI tier can rate-limit).")
@@ -590,22 +580,18 @@ def render_list(articles, profile, tab_name: str):
             st.markdown('<div class="card">', unsafe_allow_html=True)
             st.markdown(f'<div class="title">{a["title"]}</div>', unsafe_allow_html=True)
             st.markdown(f'<div class="meta">{a["source"]} • {as_ist(a["published"])}</div>', unsafe_allow_html=True)
-
-            # chips
             st.markdown('<div class="chips"><span class="chip">Readable</span><span class="chip">Actionable</span></div>', unsafe_allow_html=True)
 
             teaser = teaser_summary(a["title"], a.get("desc") or "", a["source"], profile["reading_level"], as_ist(a["published"]))
             st.markdown(f'<div class="teaser">{teaser}</div>', unsafe_allow_html=True)
 
-            c1, c2, c3 = st.columns([1.2,1.2,2])
+            c1, c2, _ = st.columns([1.2,1.2,2])
             with c1:
                 if st.button("🔍 Expand analysis", key=btn_key):
                     with st.spinner("Personalizing…"):
                         st.session_state[content_key] = expand_summary(a, profile, profile["reading_level"])
             with c2:
                 st.markdown(f'<a class="btnlink" href="{a["url"]}" target="_blank">↗ Read original</a>', unsafe_allow_html=True)
-            with c3:
-                pass
 
             if st.session_state[content_key]:
                 st.markdown("<hr class='sep'/>", unsafe_allow_html=True)
@@ -617,7 +603,6 @@ def render_list(articles, profile, tab_name: str):
                             ans = clarify(a, profile, profile["reading_level"], question=q or None)
                             st.write(ans)
 
-                # memory buttons
                 c_like, c_dislike, c_save = st.columns([1,1,1])
                 with c_like:
                     if st.button("👍 Useful", key=f"like_{base}"):
@@ -631,9 +616,9 @@ def render_list(articles, profile, tab_name: str):
 
             st.markdown("</div>", unsafe_allow_html=True)
 
-# -----------------------------
-# MAIN UI
-# -----------------------------
+# =========================
+# MAIN
+# =========================
 if not st.session_state.onboarded:
     show_onboarding()
     st.stop()
@@ -664,7 +649,6 @@ with st.sidebar:
 st.markdown('<div class="header-title">🗞️ Your personalized briefing</div>', unsafe_allow_html=True)
 st.markdown('<div class="header-sub">Depth on demand • Local-first • Actionable next steps</div>', unsafe_allow_html=True)
 
-# Tabs: For You, Tech, Finance, Economy, Health & Wellness, Global
 tabs = st.tabs(["✨ For You", "💻 Tech", "💸 Finance", "📈 Economy", "🩺 Health & Wellness", "🌍 Global"])
 
 with tabs[0]:
