@@ -9,12 +9,12 @@ from dateutil import parser as dtparse
 st.set_page_config(page_title="News Agent MVP", page_icon="📰", layout="wide")
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# Secrets (set these in Streamlit Cloud → Advanced settings → Secrets)
+# Secrets (set these in Streamlit Cloud → App ▸ Settings ▸ Secrets)
 NEWSAPI_KEY = st.secrets["NEWSAPI_KEY"]
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 
 # -----------------------------
-# Helpers
+# Helpers (utilities)
 # -----------------------------
 TABLOID = {
     "TMZ","Daily Mail","Page Six","The Sun","US Weekly","Radar Online","E! Online",
@@ -79,6 +79,23 @@ def shape(arts):
     out.sort(key=score, reverse=True)
     return out
 
+def apply_exclusions(articles, exclude_kws):
+    if not exclude_kws:
+        return articles
+    out = []
+    for a in articles:
+        text = " ".join([a.get("title",""), a.get("desc",""), a.get("source","")]).lower()
+        if any(kw in text for kw in exclude_kws):
+            continue
+        out.append(a)
+    return out
+
+def clear_expanded_summaries():
+    """Wipe cached expanded text so reading-level changes take effect."""
+    for k in list(st.session_state.keys()):
+        if k.startswith("content_expand_"):
+            del st.session_state[k]
+
 # -----------------------------
 # NewsAPI calls (Top & Everything)
 # -----------------------------
@@ -107,19 +124,40 @@ def fetch_national(country: str):
     # Primary: country top-headlines
     pool = []
     try:
-        pool += news_top({"category":"general", "country": country})
-        pool += news_top({"category":"business","country": country})
-        pool += news_top({"category":"technology","country": country})
+        pool += news_top({"category":"general",    "country": country})
+        pool += news_top({"category":"business",   "country": country})
+        pool += news_top({"category":"technology", "country": country})
     except Exception:
         pass
 
     items = shape(pool) if pool else []
 
-    # Fallback if the country feed is empty or too small (rate-limit/sparse)
-    if len(items) < 5:
+    # Fallback: restrict by local domains so it stays national
+    if len(items) < 6:
+        local_domains_map = {
+            "in": [
+                "thehindu.com","indianexpress.com","hindustantimes.com","livemint.com",
+                "economictimes.indiatimes.com","business-standard.com","ndtv.com",
+                "timesofindia.indiatimes.com","moneycontrol.com","thewire.in","scroll.in"
+            ],
+            "us": ["nytimes.com","wsj.com","washingtonpost.com","apnews.com","reuters.com","cnn.com","npr.org"],
+            "gb": ["bbc.co.uk","theguardian.com","ft.com","telegraph.co.uk","independent.co.uk","sky.com"],
+            "au": ["abc.net.au","smh.com.au","theaustralian.com.au","theage.com.au","news.com.au"],
+            "sg": ["straitstimes.com","channelnewsasia.com","todayonline.com","businesstimes.com.sg"],
+            "ca": ["cbc.ca","ctvnews.ca","theglobeandmail.com","nationalpost.com","financialpost.com"],
+        }
+        domains = local_domains_map.get(country, [])
         try:
-            backup = news_everything("India OR New Delhi OR RBI OR Parliament OR Supreme Court", days=2)
-            items = shape(backup)
+            backup = news_everything("economy OR policy OR parliament OR election OR business OR technology", days=2)
+            shaped = shape(backup)
+            if domains:
+                def domain_of(url: str):
+                    try:
+                        return url.split("/")[2].replace("www.","")
+                    except:
+                        return ""
+                shaped = [a for a in shaped if domain_of(a["url"]) in domains]
+            items = shaped or items
         except Exception:
             pass
 
@@ -212,6 +250,8 @@ def init_state():
         "country": "in",
     })
     st.session_state.setdefault("onboarded", False)
+    st.session_state.setdefault("exclude_str", "celebrity,gossip,TMZ")
+
 init_state()
 
 # -----------------------------
@@ -253,33 +293,31 @@ def show_onboarding():
             "reading_level": lvl
         })
         st.session_state.onboarded = True
-        st.rerun()
+        st.rerun()  # (was experimental_rerun)
 
 # -----------------------------
-# Article list renderer (1-line + Expand + Clarify)
+# Article list renderer (1-line + Expand + Clarify) — collision-proof keys
 # -----------------------------
 def render_list(articles, profile, tab_name: str):
     """
-    Renders a list of articles with: 1-line snippet, Expand (profile summary), Clarify.
-    Keys are made unique per TAB + INDEX + URL + reading level.
-    We also keep widget keys and stored-content keys different to avoid collisions.
+    Renders a list with: 1-line snippet, Expand (profile summary), Clarify.
+    Keys are unique per TAB + INDEX + URL + reading level.
+    Widget keys and stored-content keys are different to avoid collisions.
     """
     if not articles:
-        st.info("No articles available right now. Try switching tabs or refreshing in a minute (NewsAPI can rate-limit free keys).")
+        st.info("No articles available right now. Try switching tabs or refreshing in a minute (the free NewsAPI tier can rate-limit).")
         return
 
     for idx, a in enumerate(articles):
         one = (a["desc"] or a["title"]).split(".")[0]
 
-        # Unique keys per row & level
         base = f"{tab_name}_{idx}_{abs(hash(a['url']))}"
-        btn_key      = f"btn_expand_{base}"                           # button widget key
-        content_key  = f"content_expand_{base}_{profile['reading_level']}"  # where we store expanded text
+        btn_key      = f"btn_expand_{base}"                                # button widget key
+        content_key  = f"content_expand_{base}_{profile['reading_level']}" # store expanded text
         clarify_exp  = f"exp_clar_{base}"
         clarify_qkey = f"clar_q_{base}"
         clarify_btn  = f"clar_btn_{base}"
 
-        # init content slot if needed
         if content_key not in st.session_state:
             st.session_state[content_key] = None
 
@@ -300,11 +338,8 @@ def render_list(articles, profile, tab_name: str):
             with c2:
                 st.markdown(f"[Read original]({a['url']})")
 
-            # Show expanded content
             if st.session_state[content_key]:
                 st.markdown(st.session_state[content_key])
-
-                # Clarify block (unique keys)
                 with st.expander("How? Why? (ask for causal explanation)", expanded=False):
                     q = st.text_input("Ask a question (optional):", key=clarify_qkey, value="")
                     if st.button("Clarify", key=clarify_btn):
@@ -331,8 +366,25 @@ with st.sidebar:
                                 index=["in","us","gb","sg","au","ca"].index(p["country"]))
     interests_str = st.text_area("Interests (comma separated)", value=", ".join(p["interests"]), height=90)
     p["interests"] = [i.strip() for i in interests_str.split(",") if i.strip()]
-    p["reading_level"] = st.radio("Reading level", ["basic","normal","high"],
-                                  index=["basic","normal","high"].index(p["reading_level"]), horizontal=True)
+
+    # Reading level with auto-invalidate of expanded summaries
+    old_level = p["reading_level"]
+    p["reading_level"] = st.radio(
+        "Reading level",
+        ["basic","normal","high"],
+        index=["basic","normal","high"].index(p["reading_level"]),
+        horizontal=True
+    )
+    if p["reading_level"] != old_level:
+        clear_expanded_summaries()
+    st.caption("Change level → summaries refresh on next Expand.")
+
+    # Exclude topics
+    exclude_str = st.text_input("Exclude topics (comma separated)",
+                                value=st.session_state.get("exclude_str", "celebrity,gossip,TMZ"))
+    st.session_state["exclude_str"] = exclude_str
+    EXCLUDE_KWS = [w.strip().lower() for w in exclude_str.split(",") if w.strip()]
+
     st.session_state.profile = p
 
 st.title("📰 News Agent — personalized & depth-on-demand")
@@ -342,6 +394,7 @@ tabs = st.tabs(["🇮🇳 National", "🌍 Global", "✨ For You"])
 with tabs[0]:
     try:
         data = fetch_national(st.session_state.profile["country"])
+        data = apply_exclusions(data, EXCLUDE_KWS)
         render_list(data, st.session_state.profile, tab_name="national")
     except Exception as e:
         st.error(f"Failed to load National feed: {e}")
@@ -349,6 +402,7 @@ with tabs[0]:
 with tabs[1]:
     try:
         data = fetch_global()
+        data = apply_exclusions(data, EXCLUDE_KWS)
         render_list(data, st.session_state.profile, tab_name="global")
     except Exception as e:
         st.error(f"Failed to load Global feed: {e}")
@@ -356,6 +410,7 @@ with tabs[1]:
 with tabs[2]:
     try:
         data = fetch_for_you(st.session_state.profile["interests"])
+        data = apply_exclusions(data, EXCLUDE_KWS)
         render_list(data, st.session_state.profile, tab_name="foryou")
     except Exception as e:
         st.error(f"Failed to load For You feed: {e}")
