@@ -238,7 +238,7 @@ def show_onboarding():
             "reading_level": lvl
         })
         st.session_state.onboarded = True
-        st.experimental_rerun()
+        st.rerun()
 
 # -----------------------------
 # Article list renderer (1-line + Expand + Clarify)
